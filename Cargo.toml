@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/sand-sim", "crates/sand-bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
