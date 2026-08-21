@@ -185,3 +185,65 @@ fn unknown_matter_goes_back_to_js() {
         "незнакомый материал обязан уйти в JS"
     );
 }
+
+// ---- отбор чанков --------------------------------------------------------
+
+use crate::chunk::{inspect, Gate, Reason, Verdict};
+
+fn open_gate() -> Gate<'static> {
+    Gate { mod_hooks: &[], block_types: &[], block_width: 0, block_scale: 4 }
+}
+
+#[test]
+fn plain_chunk_goes_native() {
+    let mut b = Bench::new(16, 16);
+    b.put(4, 4, 1, 1600.0);
+    let table = sand_table();
+    let world = b.world();
+    assert_eq!(inspect(&world, &table, &open_gate(), 0, 0, 16, 16), Verdict::Native);
+}
+
+#[test]
+fn chunk_with_mod_hook_goes_back_to_js() {
+    let mut b = Bench::new(16, 16);
+    b.put(4, 4, 1, 1600.0);
+    let table = sand_table();
+    // На тип 1 подписан перехватчик мода.
+    let mut hooks = vec![0u8; 256];
+    hooks[1] = 1;
+    let gate = Gate { mod_hooks: &hooks, block_types: &[], block_width: 0, block_scale: 4 };
+    let world = b.world();
+    assert_eq!(
+        inspect(&world, &table, &gate, 0, 0, 16, 16),
+        Verdict::Skip(Reason::ModHook),
+        "клетку с мод-хуком ядро трогать не имеет права"
+    );
+}
+
+#[test]
+fn chunk_with_structure_goes_back_to_js() {
+    let mut b = Bench::new(16, 16);
+    b.put(4, 4, 1, 1600.0);
+    let table = sand_table();
+    // Сетка структур 4x4 тайла, машина в одном из них.
+    let mut blocks = vec![0u8; 16];
+    blocks[5] = 7;
+    let gate = Gate { mod_hooks: &[], block_types: &blocks, block_width: 4, block_scale: 4 };
+    let world = b.world();
+    assert_eq!(
+        inspect(&world, &table, &gate, 0, 0, 16, 16),
+        Verdict::Skip(Reason::Structure)
+    );
+}
+
+#[test]
+fn unknown_matter_keeps_the_chunk_in_js() {
+    let mut b = Bench::new(16, 16);
+    b.put(4, 4, 200, 1000.0); // типа нет в таблице
+    let table = sand_table();
+    let world = b.world();
+    assert_eq!(
+        inspect(&world, &table, &open_gate(), 0, 0, 16, 16),
+        Verdict::Skip(Reason::UnknownMatter)
+    );
+}

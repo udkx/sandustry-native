@@ -1,2 +1,3 @@
 /target
 /fixtures/*.json
+/js/sand.node

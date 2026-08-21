@@ -11,10 +11,12 @@
 #[cfg(test)]
 mod tests;
 
+pub mod chunk;
 pub mod events;
 pub mod physics;
 pub mod view;
 
+pub use chunk::{inspect, Gate, Reason, Stats, Verdict};
 pub use events::{Event, EventQueue, EventSink, NullSink};
 pub use physics::{reset_updated, update_region, Matter, MatterTable};
 pub use view::{Elements, World};

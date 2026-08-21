@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sand-sim", "crates/sand-bench"]
+members = ["crates/sand-sim", "crates/sand-bench", "crates/sand-node"]
 
 [workspace.package]
 version = "0.1.0"
