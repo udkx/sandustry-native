@@ -20,6 +20,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+const asar = require('@electron/asar');
+
 const { resolveAsar } = require('./find-game');
 const { patchWorker } = require('./patch-worker');
 const { patchMain } = require('./patch-main');
@@ -54,11 +56,6 @@ function findCore(root) {
       process.platform === 'darwin' ? 'libsand_node.dylib' : 'libsand_node.so'} js/sand.node`);
 }
 
-function asarCli(args) {
-  execFileSync(process.execPath, [require.resolve('@electron/asar/bin/asar.js'), ...args],
-    { stdio: 'inherit' });
-}
-
 /** Проверяет, что это та версия игры, на которой патч проверялся. */
 function checkVersion(unpacked, force) {
   let version = null;
@@ -88,7 +85,7 @@ function resign(asarPath) {
   execFileSync('codesign', ['--force', '--sign', '-', appBundle], { stdio: 'inherit' });
 }
 
-function install({ game, force }) {
+async function install({ game, force }) {
   const root = path.join(__dirname, '..');
   const asarPath = resolveAsar(game);
   const resources = path.dirname(asarPath);
@@ -105,7 +102,7 @@ function install({ game, force }) {
   const staging = fs.mkdtempSync(path.join(os.tmpdir(), 'sandustry-native-'));
   try {
     console.log('распаковываю app.asar');
-    asarCli(['extract', asarPath, staging]);
+    asar.extractAll(asarPath, staging);
 
     const version = checkVersion(staging, force);
     console.log(`  версия игры: ${version}`);
@@ -130,7 +127,11 @@ function install({ game, force }) {
 
     console.log('сохраняю оригинал и собираю архив');
     fs.copyFileSync(asarPath, backup);
-    asarCli(['pack', staging, asarPath, '--unpack-dir', 'node_modules/steamworks.js/**']);
+    // steamworks.js — нативный модуль: его .node и .dylib обязаны лежать на
+    // диске рядом с архивом, иначе игра не свяжется со Steam и не запустится.
+    await asar.createPackageWithOptions(staging, asarPath, {
+      unpackDir: 'node_modules/steamworks.js/**',
+    });
 
     resign(asarPath);
 
@@ -158,7 +159,7 @@ function revert({ game }) {
   console.log('патч снят, игра вернулась к оригиналу');
 }
 
-function main() {
+async function main() {
   const argv = process.argv.slice(2);
   const at = argv.indexOf('--game');
   const options = {
@@ -167,11 +168,16 @@ function main() {
   };
   try {
     if (argv.includes('--revert')) revert(options);
-    else install(options);
+    else await install(options);
   } catch (err) {
     console.error(`\nне вышло: ${err.message}`);
     process.exit(1);
   }
 }
 
-if (require.main === module) main();
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(`\nне вышло: ${err && err.stack || err}`);
+    process.exit(1);
+  });
+}

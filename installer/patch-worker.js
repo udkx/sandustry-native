@@ -334,10 +334,14 @@ function __nativeInit(state) {
 // живёт в замыканиях её модулей, поэтому ядро только копит список изменённых
 // клеток, а перерисовывает их её же функция.
 function __nativeRepaint(state) {
-  const n = __nativeSim.takeChanged();
-  if (!n) return;
+  // Получателя проверяем до того, как забрать список: takeChanged опустошает
+  // очередь ядра безвозвратно. Уйти после неё — значит потерять все клетки,
+  // которые ядро уже подвинуло: мир считается верно, а на экране остаётся
+  // прошлый кадр, и никакой ошибки при этом не видно.
   const ops = self.__cellOps;
   if (!ops || typeof ops.Gz !== 'function') return;
+  const n = __nativeSim.takeChanged();
+  if (!n) return;
   const cells = state.shared.sim.cellIds;
   const w = __nativeWidth;
   __nativeMs.gz += n;
@@ -358,10 +362,14 @@ function __nativeRepaint(state) {
 // тихо потерять их: семя не прорастёт, огонь не погаснет, вода на лаве не
 // станет паром.
 function __nativeFinishDeferred(state, dt) {
-  const pairs = __nativeSim.takeNeedsJs();
-  if (!pairs) return;
+  // Порядок тот же и по той же причине: это клетки, которые ядро осознанно
+  // вернуло игре. Забрать список и не досчитать — значит молча потерять
+  // событие: семя не прорастёт, огонь не погаснет, вода на лаве не станет
+  // паром.
   const matter = self.__matterModule;
   if (!matter || typeof matter.cJ !== 'function') return;
+  const pairs = __nativeSim.takeNeedsJs();
+  if (!pairs) return;
   const sim = state.shared.sim;
   const cells = sim.cellIds, types = sim.elementData.type;
   __nativeMs.cJ += pairs;
@@ -383,10 +391,13 @@ function __nativeFlush(state, dt) {
   __nativeRepaint(state);
   __nativeMs.needsJs += __t1 - __t0;
   __nativeMs.repaint += performance.now() - __t1;
-  const n = __nativeSim.takeUpdated();
-  if (!n) return;
+  // И здесь так же: слоты, забранные из ядра и не влитые в список игры,
+  // останутся помеченными навсегда — игра гасит hasBeenUpdated, только пройдя
+  // по своему списку, и эти элементы выпадут из симуляции до конца сессии.
   const list = state.store && state.store.world && state.store.world.updatedElementIndices;
   if (!list) return;
+  const n = __nativeSim.takeUpdated();
+  if (!n) return;
   for (let i = 0; i < n; i++) list.push(__nativeUpdatedBuffer[i]);
 }
 
@@ -420,6 +431,12 @@ function __nativeColumn(origColumn, origChunk, state, cx, even, dt, margin) {
     __nativeMs.core += performance.now() - __t0;
   } catch (err) {
     __nativeLog('сбой на колонке, дальше считает JS: ' + (err && err.message));
+    // Ядро могло упасть на середине колонки, уже подвинув часть клеток.
+    // Раскладываем накопленное: иначе растр останется в прошлом, а
+    // помеченные слоты залипнут. Чанки, которые ядро успело посчитать, JS
+    // пересчитает следом — один сдвоенный ход на аварийном пути дешевле
+    // рассинхрона, который останется навсегда.
+    try { __nativeFlush(state, dt); } catch (_) {}
     __nativeReady = false;
     return origColumn(state, cx, even, dt, margin);
   }
