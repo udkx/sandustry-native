@@ -10,10 +10,13 @@
 use std::time::Instant;
 
 use sand_sim::events::{EventQueue, NullSink};
-use sand_sim::physics::{update_region, Matter, MatterTable};
+use sand_sim::physics::{update_region, Marks, Matter, MatterTable, Rng};
 use sand_sim::view::{Elements, World};
 
 use serde::Deserialize;
+
+/// Шаг времени игры: один кадр из шестидесяти.
+const DT: f32 = 1.0 / 60.0;
 
 #[derive(Deserialize)]
 struct Dump {
@@ -82,6 +85,7 @@ struct State {
     kind: Vec<u8>,
     velocity_x: Vec<f32>,
     velocity_y: Vec<f32>,
+    min_velocity_x: Vec<f32>,
     min_velocity_y: Vec<f32>,
     threshold_x: Vec<f32>,
     threshold_y: Vec<f32>,
@@ -89,12 +93,17 @@ struct State {
     is_free_falling: Vec<u8>,
     has_been_updated: Vec<u8>,
     skip_physics: Vec<u8>,
+    has_duration: Vec<u8>,
+    duration_left: Vec<f32>,
     x: Vec<u16>,
     y: Vec<u16>,
     last_side_checked: Vec<i16>,
     moves_y_axis: Vec<u16>,
     moves_y_axis_count: Vec<u16>,
+    chunk_now: Vec<u8>,
     chunk_dirty: Vec<u8>,
+    terrain_type: Vec<u8>,
+    changed: Vec<u32>,
 }
 
 impl State {
@@ -105,6 +114,7 @@ impl State {
             kind: vec![0; cap],
             velocity_x: vec![0.0; cap],
             velocity_y: vec![0.0; cap],
+            min_velocity_x: vec![0.0; cap],
             min_velocity_y: vec![0.0; cap],
             threshold_x: vec![0.0; cap],
             threshold_y: vec![0.0; cap],
@@ -112,12 +122,19 @@ impl State {
             is_free_falling: vec![0; cap],
             has_been_updated: vec![0; cap],
             skip_physics: vec![0; cap],
+            has_duration: vec![0; cap],
+            duration_left: vec![0.0; cap],
             x: vec![0; cap],
             y: vec![0; cap],
             last_side_checked: vec![0; cap],
             moves_y_axis: vec![0; cap],
             moves_y_axis_count: vec![0; cap],
+            chunk_now: Vec::new(),
             chunk_dirty: Vec::new(),
+            // В снимке таблицы терраина нет: там идентификатор клетки и есть
+            // её тип.
+            terrain_type: (0..=1000u32).map(|i| i as u8).collect(),
+            changed: Vec::new(),
         };
         for e in &d.elements {
             let i = e.i as usize;
@@ -143,18 +160,25 @@ impl State {
         let cw = (region.w + chunk_size - 1) / chunk_size;
         let ch = (region.h + chunk_size - 1) / chunk_size;
         self.chunk_dirty.resize((cw * ch) as usize, 0);
+        // Снимок берётся из живого мира целиком: все его чанки считаем
+        // активными, иначе замер мерил бы пропуск, а не работу.
+        self.chunk_now.resize((cw * ch) as usize, 1);
         World {
             width: region.w,
             height: region.h,
             chunk_size,
+            chunk_should_update: &self.chunk_now,
             chunk_dirty_next: &mut self.chunk_dirty,
+            terrain_type: &self.terrain_type,
             chunk_width: cw,
             chunk_height: ch,
             cells: &mut self.cells,
+            changed: &mut self.changed,
             elements: Elements {
                 kind: &mut self.kind,
                 velocity_x: &mut self.velocity_x,
                 velocity_y: &mut self.velocity_y,
+                min_velocity_x: &mut self.min_velocity_x,
                 min_velocity_y: &mut self.min_velocity_y,
                 threshold_x: &mut self.threshold_x,
                 threshold_y: &mut self.threshold_y,
@@ -162,6 +186,8 @@ impl State {
                 is_free_falling: &mut self.is_free_falling,
                 has_been_updated: &mut self.has_been_updated,
                 skip_physics: &mut self.skip_physics,
+                has_duration: &mut self.has_duration,
+                duration_left: &mut self.duration_left,
                 x: &mut self.x,
                 y: &mut self.y,
                 last_side_checked: &mut self.last_side_checked,
@@ -199,10 +225,12 @@ fn default_table(state: &State) -> MatterTable {
         }
         seen[k as usize] = true;
         let d = state.density[i];
+        // Песок в игре — Solid, а не Powder: у Powder обработчика движения
+        // нет вовсе, и приняв одно за другое, замер мерил бы стоящий мир.
         if d <= 120.0 {
-            table.set(k, Matter::Liquid, 5);
+            table.set(k, Matter::Liquid, 1.0);
         } else {
-            table.set(k, Matter::Powder, 0);
+            table.set(k, Matter::Solid, 1.0);
         }
     }
     table
@@ -258,8 +286,22 @@ fn main() {
 
     for _ in 0..20 {
         let mut s = pristine.clone();
+        let mut rng = Rng::new(1);
+        let mut marks = Marks::new();
         let mut w = s.world(region, dump.world.chunk_size);
-        update_region(&mut w, &table, &mut NullSink, 0, 0, region.w, region.h, 0);
+        update_region(
+            &mut w,
+            &table,
+            &mut NullSink,
+            &mut rng,
+            &mut marks,
+            0,
+            0,
+            region.w,
+            region.h,
+            true,
+            DT,
+        );
     }
 
     let mut times = Vec::with_capacity(iterations);
@@ -272,17 +314,27 @@ fn main() {
         let mut s = pristine.clone();
         let mut queue = EventQueue::with_capacity(1 << 18);
         let t0 = Instant::now();
+        let mut rng = Rng::new(it as u64 + 1);
+        let mut marks = Marks::new();
         let n = {
             let mut w = s.world(region, dump.world.chunk_size);
-            update_region(&mut w, &table, &mut queue, 0, 0, region.w, region.h, it as u64)
+            update_region(
+                &mut w,
+                &table,
+                &mut queue,
+                &mut rng,
+                &mut marks,
+                0,
+                0,
+                region.w,
+                region.h,
+                it % 2 == 0,
+                DT,
+            )
         };
         times.push(t0.elapsed().as_nanos() as u64);
         touched += n;
-        moved += queue
-            .events()
-            .iter()
-            .filter(|e| matches!(e, sand_sim::Event::Moved { .. }))
-            .count();
+        moved += sand_sim::last_moved();
         needs_js += queue
             .events()
             .iter()

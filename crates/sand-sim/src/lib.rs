@@ -16,7 +16,10 @@ pub mod events;
 pub mod physics;
 pub mod view;
 
-pub use chunk::{inspect, Gate, Reason, Stats, Verdict, VerdictCache};
-pub use events::{Event, EventQueue, EventSink, NullSink};
-pub use physics::{last_moved, update_region, Matter, MatterTable};
+pub use chunk::{
+    inspect, should_process, should_process_in_column, window, Gate, Reason, Stats, Verdict,
+    VerdictCache, Window,
+};
+pub use events::{Event, EventQueue, EventSink, NullSink, Why};
+pub use physics::{last_moved, update_region, Marks, Matter, MatterTable, Rng};
 pub use view::{Elements, World};

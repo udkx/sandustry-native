@@ -1,0 +1,13 @@
+{
+  "name": "sandustry-native",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Native simulation core for Sandustry 0.5.2",
+  "scripts": {
+    "install-core": "node installer/install.js",
+    "uninstall-core": "node installer/install.js --revert"
+  },
+  "dependencies": {
+    "@electron/asar": "^3.2.10"
+  }
+}

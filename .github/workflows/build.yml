@@ -1,0 +1,127 @@
+# Сборка нативного ядра под все платформы, на которых идёт Sandustry.
+#
+# .node — это обычная динамическая библиотека, и собрать её можно только на той
+# системе, для которой она предназначена: кросс-компиляция N-API упирается в
+# заголовки Node каждой платформы. Отсюда матрица.
+#
+# По тегу vX.Y.Z собранное прикладывается к черновику релиза — тестеры кладут
+# файл в prebuilt/ и запускают установщик.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: тесты ядра
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p sand-sim --release
+      - run: cargo fmt --check
+        continue-on-error: true
+
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            label: macOS arm64
+            artifact: sand-arm64-darwin.node
+            built: libsand_node.dylib
+          - os: macos-13
+            target: x86_64-apple-darwin
+            label: macOS x86_64
+            artifact: sand-x64-darwin.node
+            built: libsand_node.dylib
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: Windows x64
+            artifact: sand-x64-win32.node
+            built: sand_node.dll
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: Linux x64
+            artifact: sand-x64-linux.node
+            built: libsand_node.so
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: собрать ядро
+        run: cargo build --release -p sand-node --target ${{ matrix.target }}
+
+      - name: переименовать под платформу
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/${{ matrix.built }}" "${{ matrix.artifact }}"
+
+      # Без подписи macOS убивает процесс, который загрузил модуль, — без
+      # единого сообщения, код 137. Ad-hoc подписи достаточно; установщик
+      # подписывает файл ещё раз после копирования, но артефакт должен быть
+      # рабочим и сам по себе.
+      - name: подписать (macOS)
+        if: runner.os == 'macOS'
+        run: codesign --force --sign - "${{ matrix.artifact }}"
+
+      - name: проверить модуль без игры
+        shell: bash
+        run: |
+          mkdir -p js
+          cp "${{ matrix.artifact }}" js/sand.node
+          node js/smoke.js
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: черновик релиза
+    needs: [test, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*.node
+          body: |
+            Ядро для Sandustry 0.5.2.
+
+            Скачайте файл для своей платформы, положите его в `prebuilt/`
+            рядом с установщиком и запустите:
+
+            ```bash
+            npm install
+            node installer/install.js
+            ```
+
+            Моды Workshop при этом выключаются — они несовместимы с ядром,
+            подробности в README.

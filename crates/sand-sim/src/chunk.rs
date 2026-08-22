@@ -29,6 +29,10 @@ pub enum Reason {
     ModHook,
     /// В чанке или рядом стоит структура: фильтр, конвейер, коллектор.
     Structure,
+    /// Таймер элемента истёк, и что с ним делать дальше — решает JS. Причина
+    /// осталась в перечислении ради совместимости счётчиков: чанк целиком по
+    /// ней больше не отдаётся, только отдельная клетка событием.
+    Duration,
 }
 
 /// Внешние данные, по которым принимается решение.
@@ -162,7 +166,8 @@ impl VerdictCache {
             v if v >= VERDICT_SKIP_BASE => Some(Verdict::Skip(match v - VERDICT_SKIP_BASE {
                 0 => Reason::UnknownMatter,
                 1 => Reason::ModHook,
-                _ => Reason::Structure,
+                2 => Reason::Structure,
+                _ => Reason::Duration,
             })),
             _ => None,
         }
@@ -177,6 +182,7 @@ impl VerdictCache {
             Verdict::Skip(Reason::UnknownMatter) => VERDICT_SKIP_BASE,
             Verdict::Skip(Reason::ModHook) => VERDICT_SKIP_BASE + 1,
             Verdict::Skip(Reason::Structure) => VERDICT_SKIP_BASE + 2,
+            Verdict::Skip(Reason::Duration) => VERDICT_SKIP_BASE + 3,
         };
         self.age[chunk] = self.lifetime;
     }
@@ -191,10 +197,14 @@ impl VerdictCache {
 /// Нужна не для красоты — по ней видно, окупается ли затея на живом мире.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
+    /// Чанки, за которые никто не брался: спят, и margin никого к ним не
+    /// подтянул. Их не считает ни ядро, ни JS — как и в оригинале.
+    pub sleeping: u32,
     pub native_chunks: u32,
     pub skipped_unknown: u32,
     pub skipped_hooks: u32,
     pub skipped_structures: u32,
+    pub skipped_duration: u32,
     pub cells_touched: u32,
     /// Сколько раз вердикт взят из кэша, без прохода по клеткам.
     pub cached: u32,
@@ -210,10 +220,89 @@ impl Stats {
             Verdict::Skip(Reason::UnknownMatter) => self.skipped_unknown += 1,
             Verdict::Skip(Reason::ModHook) => self.skipped_hooks += 1,
             Verdict::Skip(Reason::Structure) => self.skipped_structures += 1,
+            Verdict::Skip(Reason::Duration) => self.skipped_duration += 1,
         }
     }
 
     pub fn total_chunks(&self) -> u32 {
-        self.native_chunks + self.skipped_unknown + self.skipped_hooks + self.skipped_structures
+        self.native_chunks
+            + self.skipped_unknown
+            + self.skipped_hooks
+            + self.skipped_structures
+            + self.skipped_duration
     }
+}
+
+/// Окно обхода чанка — арифметика из `cellOps.E` и `cellOps.k`.
+///
+/// Игра обходит не сам чанк, а окно, сдвинутое на `margin`: так граница между
+/// полосами потоков каждый кадр приходится на разное место, и шов не
+/// застывает. Обходить строго по границам чанка — значит оставить полосу
+/// шириной `margin` на стыке активного и спящего чанка не посчитанной никем.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Window {
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+}
+
+impl Window {
+    pub fn is_empty(&self) -> bool {
+        self.x0 >= self.x1 || self.y0 >= self.y1
+    }
+}
+
+/// Стоит ли вообще браться за чанк — ранний выход из `cellOps.E`.
+///
+/// Спящий чанк игра пропускает мгновенно, не касаясь его клеток. Но если
+/// окно сдвинуто margin'ом, часть активного соседа заезжает внутрь спящего —
+/// тогда чанк всё-таки обходится. Без этой проверки ядро сканирует спящие
+/// чанки целиком (дорого) и при этом теряет полосу на стыке (неверно).
+pub fn should_process(world: &World, cx: i32, cy: i32, margin_x: i32, margin_y: i32) -> bool {
+    if world.chunk_active(cx, cy) {
+        return true;
+    }
+    if margin_x > 0 && world.chunk_active(cx + 1, cy) {
+        return true;
+    }
+    if margin_y > 0 && world.chunk_active(cx, cy + 1) {
+        return true;
+    }
+    if margin_x > 0 && margin_y > 0 && world.chunk_active(cx + 1, cy + 1) {
+        return true;
+    }
+    false
+}
+
+/// То же для обхода колонкой (`cellOps.k`): margin там только по X, и сосед
+/// берётся с той стороны, куда сдвинуто окно.
+pub fn should_process_in_column(world: &World, cx: i32, cy: i32, margin_x: i32) -> bool {
+    if world.chunk_active(cx, cy) {
+        return true;
+    }
+    if margin_x == 0 {
+        return false;
+    }
+    let neighbour = if margin_x > 0 { cx + 1 } else { cx - 1 };
+    world.chunk_active(neighbour, cy)
+}
+
+/// Окно обхода. `margin_y = 0` даёт окно обхода колонкой — она сдвигает только
+/// по горизонтали.
+pub fn window(world: &World, cx: i32, cy: i32, margin_x: i32, margin_y: i32) -> Window {
+    let cs = world.chunk_size;
+
+    let left = cx * cs + margin_x;
+    let right = cx * cs + cs + margin_x;
+    // Нулевой чанк начинается с края мира: сдвигать его влево некуда.
+    let x0 = if cx == 0 { 0 } else { left.min(world.width) };
+    let x1 = right.min(world.width);
+
+    let top = cy * cs + margin_y;
+    let bottom = cy * cs + cs + margin_y;
+    let y0 = if cy == 0 { 0 } else { top.min(world.height) };
+    let y1 = bottom.min(world.height);
+
+    Window { x0: x0.max(0), y0: y0.max(0), x1, y1 }
 }

@@ -1,3 +1,9 @@
-/target
-/fixtures/*.json
-/js/sand.node
+target/
+node_modules/
+prebuilt/
+js/sand.node
+*.log
+.DS_Store
+
+# Снимок игрового мира: 41 МБ данных самой игры, в репозиторий не идёт.
+fixtures/
