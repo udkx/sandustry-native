@@ -34,6 +34,8 @@ function makeWorld() {
     modHooks: new Uint8Array(256),
     blockTypes: new Uint8Array(64),
     needsJsBuffer: new Int32Array(4096),
+    // Флаги активности чанков: ядро будит те, что изменило.
+    chunkShouldUpdateNext: new Uint8Array(4),
   };
   const sim = new native.NativeSim({
     width: W, height: H, chunkSize: CHUNK,

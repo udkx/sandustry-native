@@ -20,9 +20,17 @@ pub const MAX_STEPS: i32 = 20;
 /// уходит обратно в JS через `Event::NeedsJs`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Matter {
+    /// Сыпучее: падает, при упоре осыпается вбок. В игре это Solid и Powder.
     Powder,
     Liquid,
-    /// Всё остальное: газы, статика, частицы, слизь, машины.
+    /// Газ: всплывает сквозь всё, что плотнее.
+    Gas,
+    /// Вязкое: падает, но осыпается неохотно — мокрый песок, residue.
+    Slushy,
+    /// Не двигается вовсе. Обрабатывать нечего, но и мешать оно не мешает,
+    /// поэтому чанк с ним брать можно.
+    Static,
+    /// Всё остальное: частицы с баллистикой, wisp, незнакомые типы модов.
     Other,
 }
 
@@ -85,8 +93,14 @@ pub fn update_cell(
     }
 
     match table.matter(kind) {
-        Matter::Powder => update_powder(world, sink, x, y, slot),
+        Matter::Powder => update_powder(world, sink, x, y, slot, 0),
+        // Вязкое осыпается через раз: этого хватает, чтобы мокрый песок
+        // держал склон круче сухого, как и в оригинале.
+        Matter::Slushy => update_powder(world, sink, x, y, slot, 1),
         Matter::Liquid => update_liquid(world, table, sink, x, y, slot, kind),
+        Matter::Gas => update_gas(world, table, sink, x, y, slot, kind),
+        // Статике движение не положено — ни в оригинале, ни здесь.
+        Matter::Static => false,
         Matter::Other => {
             sink.push(Event::NeedsJs { x, y });
             false
@@ -134,6 +148,7 @@ fn update_powder(
     x: i32,
     y: i32,
     slot: usize,
+    stickiness: u16,
 ) -> bool {
     let (cy, travelled) = fall(world, x, y, slot);
     if travelled > 0 {
@@ -150,6 +165,15 @@ fn update_powder(
     let density = world.elements.density[slot];
     if world.can_enter(x, y + 1, density) {
         return false;
+    }
+
+    // Вязкое пропускает часть попыток осыпаться — отсюда более крутой склон.
+    if stickiness > 0 {
+        let counter = world.elements.moves_y_axis_count[slot].wrapping_add(1);
+        world.elements.moves_y_axis_count[slot] = counter;
+        if counter & 1 == 0 {
+            return false;
+        }
     }
 
     // Сторона выбирается по сохранённому направлению, а не случайно: так куча
@@ -186,9 +210,11 @@ fn update_liquid(
         return true;
     }
 
-    // Та же оговорка, что и у сыпучего: пока падение возможно, вбок не идём.
+    // Та же оговорка, что и у сыпучего: пока падение возможно, вбок не идём,
+    // но чанк держим активным — частица разгоняется.
     let density = world.elements.density[slot];
     if world.can_enter(x, y + 1, density) {
+        world.wake(x, y);
         return false;
     }
     let dir = if world.elements.last_side_checked[slot] >= 0 { 1 } else { -1 };
@@ -233,6 +259,53 @@ fn update_liquid(
     false
 }
 
+/// Газ: всплывает сквозь всё, что плотнее, и расходится вбок.
+///
+/// Подъём — это та же плавучесть, что и у тонущего песка, только знак другой:
+/// лёгкое вытесняет тяжёлое, а не наоборот.
+fn update_gas(
+    world: &mut World,
+    table: &MatterTable,
+    sink: &mut dyn EventSink,
+    x: i32,
+    y: i32,
+    slot: usize,
+    kind: u8,
+) -> bool {
+    let density = world.elements.density[slot];
+
+    // Вверх — если то, что там, тяжелее.
+    if world.can_rise(x, y - 1, density) {
+        world.swap_cells(x, y, x, y - 1);
+        sink.push(Event::Moved { from: (x, y), to: (x, y - 1) });
+        return true;
+    }
+
+    let dir = if world.elements.last_side_checked[slot] >= 0 { 1 } else { -1 };
+    for d in [dir, -dir] {
+        if world.can_rise(x + d, y - 1, density) {
+            world.swap_cells(x, y, x + d, y - 1);
+            world.elements.last_side_checked[slot] = d as i16;
+            sink.push(Event::Moved { from: (x, y), to: (x + d, y - 1) });
+            return true;
+        }
+    }
+
+    // Подниматься некуда — расходимся вбок, заполняя объём.
+    let reach = table.dispersion(kind).min(4);
+    for d in [dir, -dir] {
+        for step in 1..=reach {
+            if world.can_rise(x + d * step, y, density) {
+                world.swap_cells(x, y, x + d * step, y);
+                world.elements.last_side_checked[slot] = d as i16;
+                sink.push(Event::Moved { from: (x, y), to: (x + d * step, y) });
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Сброс флагов «обработано» перед проходом.
 ///
 /// Игра гасит их в конце тика, пробегая по списку тронутых элементов. При
@@ -258,13 +331,30 @@ pub fn update_region(
     y1: i32,
     frame: u64,
 ) -> usize {
-    let parity = (frame & 1) as u8;
     let ltr = frame % 2 == 0;
     let mut touched = 0;
+    let mut moved = 0usize;
+
+    // Защита от повторной обработки — своя, по позициям внутри участка.
+    //
+    // Игровой флаг `hasBeenUpdated` для этого не годится: игра гасит его в
+    // конце тика, пробегая по списку тронутых элементов, а наш список ей
+    // неизвестен. Клетка, помеченная нами, осталась бы «уже обработанной»
+    // навсегда и перестала двигаться вообще. Битовая карта на участок стоит
+    // двести байт на чанк и живёт ровно один проход.
+    let w = (x1 - x0) as usize;
+    let h = (y1 - y0) as usize;
+    let mut done = vec![0u64; (w * h + 63) / 64];
 
     for y in (y0..y1).rev() {
         for i in x0..x1 {
             let x = if ltr { i } else { x1 - 1 - (i - x0) };
+
+            let local = (y - y0) as usize * w + (x - x0) as usize;
+            if done[local >> 6] & (1u64 << (local & 63)) != 0 {
+                continue;
+            }
+
             let id = world.cells[world.idx(x, y)];
             if !is_element(id) {
                 continue;
@@ -273,13 +363,66 @@ pub fn update_region(
             if slot >= world.elements.kind.len() || world.elements.kind[slot] == 0 {
                 continue;
             }
-            if world.elements.has_been_updated[slot] == parity {
+
+            // Элемент, уже посчитанный игрой в этом кадре, трогать нельзя:
+            // области обхода перекрываются, и второй раз за тик он пройдёт
+            // двойной путь. На экране это выглядит как рваные струи — часть
+            // частиц улетает вперёд, часть стоит.
+            //
+            // Флаг только читаем. Ставить его нельзя: гасит его игра, пробегая
+            // по своему списку тронутых элементов, а нас в этом списке нет —
+            // помеченное нами залипло бы навсегда.
+            if world.elements.has_been_updated[slot] == 1 {
                 continue;
             }
-            world.elements.has_been_updated[slot] = parity;
+
             touched += 1;
-            update_cell(world, table, sink, x, y, slot);
+            let moved_to = update_cell_at(world, table, sink, x, y, slot);
+            if moved_to.is_some() {
+                moved += 1;
+            }
+
+            // Помечаем клетку, куда частица уехала: если она внутри участка и
+            // обход ещё до неё дойдёт, второй раз за тик её трогать нельзя.
+            if let Some((nx, ny)) = moved_to {
+                if nx >= x0 && nx < x1 && ny >= y0 && ny < y1 {
+                    let l = (ny - y0) as usize * w + (nx - x0) as usize;
+                    done[l >> 6] |= 1u64 << (l & 63);
+                }
+            }
         }
     }
+    MOVED.with(|m| m.set(moved));
     touched
+}
+
+thread_local! {
+    /// Сколько клеток сдвинулось за последний проход — для диагностики.
+    static MOVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Сколько клеток сдвинул последний вызов `update_region`.
+pub fn last_moved() -> usize {
+    MOVED.with(|m| m.get())
+}
+
+/// Обновление клетки с возвратом новой позиции, если она сдвинулась.
+fn update_cell_at(
+    world: &mut World,
+    table: &MatterTable,
+    sink: &mut dyn EventSink,
+    x: i32,
+    y: i32,
+    slot: usize,
+) -> Option<(i32, i32)> {
+    let before = (world.elements.x[slot], world.elements.y[slot]);
+    if !update_cell(world, table, sink, x, y, slot) {
+        return None;
+    }
+    let after = (world.elements.x[slot], world.elements.y[slot]);
+    if after != before {
+        Some((after.0 as i32, after.1 as i32))
+    } else {
+        None
+    }
 }

@@ -73,6 +73,14 @@ pub struct World<'a> {
     pub chunk_size: i32,
     pub cells: &'a mut [CellId],
     pub elements: Elements<'a>,
+    /// Флаги «чанк считать в следующем кадре».
+    ///
+    /// Игра держит их двойным буфером и ставит при каждом изменении клетки.
+    /// Если их не ставить, чанк после обработки засыпает: движение идёт
+    /// несколько кадров, потом встаёт, пока чанк не разбудит что-то извне.
+    pub chunk_dirty_next: &'a mut [u8],
+    pub chunk_width: i32,
+    pub chunk_height: i32,
 }
 
 impl<'a> World<'a> {
@@ -130,6 +138,54 @@ impl<'a> World<'a> {
         density > self.density_at(x, y)
     }
 
+    /// Может ли лёгкое подняться в эту клетку, вытеснив то, что тяжелее.
+    /// Зеркало `can_enter`: там тонет тяжёлое, здесь всплывает лёгкое.
+    #[inline(always)]
+    pub fn can_rise(&self, x: i32, y: i32, density: f32) -> bool {
+        let id = self.cell(x, y);
+        if id == EMPTY {
+            return true;
+        }
+        if !is_element(id) {
+            return false;
+        }
+        density < self.density_at(x, y)
+    }
+
+    /// Разбудить чанк клетки на следующий кадр, а если клетка у края — то и
+    /// соседний: движение через границу должно оживить обе стороны.
+    #[inline(always)]
+    pub fn wake(&mut self, x: i32, y: i32) {
+        if self.chunk_dirty_next.is_empty() || self.chunk_size <= 0 {
+            return;
+        }
+        let cs = self.chunk_size;
+        let (cx, cy) = (x / cs, y / cs);
+        let (lx, ly) = (x % cs, y % cs);
+
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                // Соседей трогаем только когда клетка действительно на кромке:
+                // будить весь квадрат вокруг каждой песчинки — значит держать
+                // мир вечно бодрствующим и потерять весь смысл этих флагов.
+                if dx != 0 && !(lx == 0 && dx < 0) && !(lx == cs - 1 && dx > 0) {
+                    continue;
+                }
+                if dy != 0 && !(ly == 0 && dy < 0) && !(ly == cs - 1 && dy > 0) {
+                    continue;
+                }
+                let (nx, ny) = (cx + dx, cy + dy);
+                if nx < 0 || ny < 0 || nx >= self.chunk_width || ny >= self.chunk_height {
+                    continue;
+                }
+                let i = (ny * self.chunk_width + nx) as usize;
+                if i < self.chunk_dirty_next.len() {
+                    self.chunk_dirty_next[i] = 1;
+                }
+            }
+        }
+    }
+
     /// Перестановка двух клеток вместе с координатами в полях элементов.
     ///
     /// Координаты обязаны ехать следом: игра держит `x`/`y` в самих элементах и
@@ -153,5 +209,9 @@ impl<'a> World<'a> {
             self.elements.x[i] = bx as u16;
             self.elements.y[i] = by as u16;
         }
+
+        // Обе клетки изменились — значит оба чанка должны проснуться.
+        self.wake(ax, ay);
+        self.wake(bx, by);
     }
 }

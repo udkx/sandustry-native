@@ -1,7 +1,7 @@
 //! Базовые проверки поведения. Не «код написан», а «песок падает, вода течёт».
 
 use crate::events::{Event, EventQueue};
-use crate::physics::{reset_updated, update_region, Matter, MatterTable};
+use crate::physics::{update_region, Matter, MatterTable};
 use crate::view::{Elements, World, ELEMENT_MIN};
 
 /// Маленький мир для тестов: сетка плюс поля на несколько элементов.
@@ -24,6 +24,7 @@ struct Bench {
     side: Vec<i16>,
     my: Vec<u16>,
     myc: Vec<u16>,
+    chunk_dirty: Vec<u8>,
     next: u32,
 }
 
@@ -49,6 +50,7 @@ impl Bench {
             side: vec![0; cap],
             my: vec![0; cap],
             myc: vec![0; cap],
+            chunk_dirty: vec![0; 64],
             next: 0,
         }
     }
@@ -76,6 +78,9 @@ impl Bench {
             width: self.w,
             height: self.h,
             chunk_size: 40,
+            chunk_dirty_next: &mut self.chunk_dirty,
+            chunk_width: (self.w + 39) / 40,
+            chunk_height: (self.h + 39) / 40,
             cells: &mut self.cells,
             elements: Elements {
                 kind: &mut self.kind,
@@ -102,7 +107,6 @@ impl Bench {
         let mut queue = EventQueue::with_capacity(1 << 16);
         for t in 0..ticks {
             let mut world = self.world();
-            reset_updated(&mut world, t);
             update_region(&mut world, table, &mut queue, 0, 0, w, h, t);
         }
         queue

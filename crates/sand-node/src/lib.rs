@@ -11,7 +11,7 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use sand_sim::chunk::{inspect, Gate, Stats, Verdict};
+use sand_sim::chunk::{inspect, Gate, Stats, Verdict, VerdictCache};
 use sand_sim::events::{Event, EventSink};
 use sand_sim::physics::{update_region, Matter, MatterTable};
 use sand_sim::view::{Elements, World};
@@ -65,8 +65,20 @@ pub struct NativeSim {
     /// возникало аллокации.
     needs_js: Int32Array,
 
+    /// Флаги «чанк считать в следующем кадре» — второй буфер игры. Ядро
+    /// обязано их ставить, иначе подвинутые им чанки засыпают, и движение
+    /// идёт рывками: несколько кадров работает, потом встаёт до случайного
+    /// пробуждения со стороны JS.
+    chunk_dirty_next: Uint8Array,
+    chunks_high: i32,
+
     table: MatterTable,
     stats: Stats,
+    /// Вердикты по чанкам живут несколько тиков: осмотр стоит полного прохода
+    /// по клеткам, и делать его каждый раз — значит добавить к работе лишний
+    /// скан вместо того, чтобы что-то сэкономить.
+    cache: VerdictCache,
+    chunks_wide: i32,
 }
 
 #[napi]
@@ -75,6 +87,12 @@ impl NativeSim {
     /// аргументы здесь read-only превратились бы в источник ошибок.
     #[napi(constructor)]
     pub fn new(config: Object) -> Result<Self> {
+        let world_w = config.get_named_property::<i32>("width").unwrap_or(0);
+        let world_h = config.get_named_property::<i32>("height").unwrap_or(0);
+        let chunk = config.get_named_property::<i32>("chunkSize").unwrap_or(40).max(1);
+        let chunks_wide = (world_w + chunk - 1) / chunk;
+        let chunks_high = (world_h + chunk - 1) / chunk;
+
         macro_rules! field {
             ($name:literal, $ty:ty) => {
                 config.get_named_property::<$ty>($name).map_err(|e| {
@@ -113,9 +131,13 @@ impl NativeSim {
             block_width: field!("blockWidth", i32),
             block_scale: field!("blockScale", i32),
             needs_js: field!("needsJsBuffer", Int32Array),
+            chunk_dirty_next: field!("chunkShouldUpdateNext", Uint8Array),
+            chunks_high,
 
             table: MatterTable::new(),
             stats: Stats::default(),
+            cache: VerdictCache::new(chunks_wide as usize * chunks_high as usize, 30),
+            chunks_wide,
         })
     }
 
@@ -124,9 +146,15 @@ impl NativeSim {
     /// кода. Всё, чего в таблице нет, ядро вернёт обратно в JS.
     #[napi]
     pub fn set_matter(&mut self, kind: u32, matter: u32, dispersion: u32) {
+        // Числа те же, что в перечислении состояний игры: Solid=1, Liquid=2,
+        // Gas=4, Static=5, Slushy=6, Powder=8. Частицы (3) и wisp (7) остаются
+        // за JS: у них баллистика и собственные траектории.
         let m = match matter {
-            1 => Matter::Powder,
+            1 | 8 => Matter::Powder,
             2 => Matter::Liquid,
+            4 => Matter::Gas,
+            5 => Matter::Static,
+            6 => Matter::Slushy,
             _ => Matter::Other,
         };
         self.table.set(kind as u8, m, dispersion.min(255) as u8);
@@ -158,6 +186,9 @@ impl NativeSim {
             width: self.width,
             height: self.height,
             chunk_size: self.chunk_size,
+            chunk_dirty_next: unsafe { self.chunk_dirty_next.as_mut() },
+            chunk_width: self.chunks_wide,
+            chunk_height: self.chunks_high,
             cells: unsafe { self.cells.as_mut() },
             elements: Elements {
                 kind: unsafe { self.kind.as_mut() },
@@ -184,7 +215,18 @@ impl NativeSim {
             block_scale: self.block_scale,
         };
 
-        let verdict = inspect(&world, &self.table, &gate, x0, y0, x1, y1);
+        let slot = (chunk_y * self.chunks_wide + chunk_x).max(0) as usize;
+        let verdict = match self.cache.get(slot) {
+            Some(v) => {
+                self.stats.cached += 1;
+                v
+            }
+            None => {
+                let v = inspect(&world, &self.table, &gate, x0, y0, x1, y1);
+                self.cache.put(slot, v);
+                v
+            }
+        };
         if let Verdict::Skip(reason) = verdict {
             self.stats.record(verdict);
             return ChunkResult {
@@ -217,6 +259,7 @@ impl NativeSim {
 
         self.stats.record(verdict);
         self.stats.cells_touched += touched as u32;
+        self.stats.moved += sand_sim::last_moved() as u32;
 
         ChunkResult {
             native: true,
@@ -236,6 +279,8 @@ impl NativeSim {
             self.stats.skipped_hooks,
             self.stats.skipped_structures,
             self.stats.cells_touched,
+            self.stats.cached,
+            self.stats.moved,
         ]
     }
 

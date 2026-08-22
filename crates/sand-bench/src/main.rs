@@ -10,7 +10,7 @@
 use std::time::Instant;
 
 use sand_sim::events::{EventQueue, NullSink};
-use sand_sim::physics::{reset_updated, update_region, Matter, MatterTable};
+use sand_sim::physics::{update_region, Matter, MatterTable};
 use sand_sim::view::{Elements, World};
 
 use serde::Deserialize;
@@ -94,6 +94,7 @@ struct State {
     last_side_checked: Vec<i16>,
     moves_y_axis: Vec<u16>,
     moves_y_axis_count: Vec<u16>,
+    chunk_dirty: Vec<u8>,
 }
 
 impl State {
@@ -116,6 +117,7 @@ impl State {
             last_side_checked: vec![0; cap],
             moves_y_axis: vec![0; cap],
             moves_y_axis_count: vec![0; cap],
+            chunk_dirty: Vec::new(),
         };
         for e in &d.elements {
             let i = e.i as usize;
@@ -138,10 +140,16 @@ impl State {
     }
 
     fn world(&mut self, region: Region, chunk_size: i32) -> World<'_> {
+        let cw = (region.w + chunk_size - 1) / chunk_size;
+        let ch = (region.h + chunk_size - 1) / chunk_size;
+        self.chunk_dirty.resize((cw * ch) as usize, 0);
         World {
             width: region.w,
             height: region.h,
             chunk_size,
+            chunk_dirty_next: &mut self.chunk_dirty,
+            chunk_width: cw,
+            chunk_height: ch,
             cells: &mut self.cells,
             elements: Elements {
                 kind: &mut self.kind,
@@ -251,7 +259,6 @@ fn main() {
     for _ in 0..20 {
         let mut s = pristine.clone();
         let mut w = s.world(region, dump.world.chunk_size);
-        reset_updated(&mut w, 0);
         update_region(&mut w, &table, &mut NullSink, 0, 0, region.w, region.h, 0);
     }
 
@@ -267,7 +274,6 @@ fn main() {
         let t0 = Instant::now();
         let n = {
             let mut w = s.world(region, dump.world.chunk_size);
-            reset_updated(&mut w, it as u64);
             update_region(&mut w, &table, &mut queue, 0, 0, region.w, region.h, it as u64)
         };
         times.push(t0.elapsed().as_nanos() as u64);

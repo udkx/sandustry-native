@@ -118,6 +118,75 @@ pub fn inspect(
     Verdict::Native
 }
 
+/// Кэш вердиктов по чанкам.
+///
+/// Осмотр — это полный проход по клеткам чанка, и делать его каждый тик
+/// означает добавить к работе ещё один скан: взяли чанк — сканируем дважды,
+/// отдали в JS — тоже дважды. Именно на этом первая версия теряла больше, чем
+/// выигрывала.
+///
+/// Состав чанка меняется медленно: материалы не появляются из ниоткуда, машины
+/// строятся руками. Поэтому вердикт держится несколько тиков и обновляется по
+/// кругу — так стоимость осмотра размазывается, а реакция на постройку машины
+/// остаётся в пределах доли секунды.
+pub struct VerdictCache {
+    verdicts: Vec<u8>,
+    age: Vec<u16>,
+    lifetime: u16,
+}
+
+const VERDICT_UNKNOWN: u8 = 0;
+const VERDICT_NATIVE: u8 = 1;
+const VERDICT_SKIP_BASE: u8 = 2;
+
+impl VerdictCache {
+    pub fn new(chunks: usize, lifetime: u16) -> Self {
+        VerdictCache {
+            verdicts: vec![VERDICT_UNKNOWN; chunks],
+            age: vec![0; chunks],
+            lifetime,
+        }
+    }
+
+    /// Вердикт, если он ещё свеж.
+    pub fn get(&mut self, chunk: usize) -> Option<Verdict> {
+        if chunk >= self.verdicts.len() {
+            return None;
+        }
+        if self.age[chunk] == 0 {
+            return None;
+        }
+        self.age[chunk] -= 1;
+        match self.verdicts[chunk] {
+            VERDICT_NATIVE => Some(Verdict::Native),
+            v if v >= VERDICT_SKIP_BASE => Some(Verdict::Skip(match v - VERDICT_SKIP_BASE {
+                0 => Reason::UnknownMatter,
+                1 => Reason::ModHook,
+                _ => Reason::Structure,
+            })),
+            _ => None,
+        }
+    }
+
+    pub fn put(&mut self, chunk: usize, verdict: Verdict) {
+        if chunk >= self.verdicts.len() {
+            return;
+        }
+        self.verdicts[chunk] = match verdict {
+            Verdict::Native => VERDICT_NATIVE,
+            Verdict::Skip(Reason::UnknownMatter) => VERDICT_SKIP_BASE,
+            Verdict::Skip(Reason::ModHook) => VERDICT_SKIP_BASE + 1,
+            Verdict::Skip(Reason::Structure) => VERDICT_SKIP_BASE + 2,
+        };
+        self.age[chunk] = self.lifetime;
+    }
+
+    /// Сброс — например, когда изменилась версия структур.
+    pub fn clear(&mut self) {
+        self.age.fill(0);
+    }
+}
+
 /// Сводка за тик: сколько чанков ядро взяло и сколько вернуло, с причинами.
 /// Нужна не для красоты — по ней видно, окупается ли затея на живом мире.
 #[derive(Clone, Copy, Debug, Default)]
@@ -127,6 +196,11 @@ pub struct Stats {
     pub skipped_hooks: u32,
     pub skipped_structures: u32,
     pub cells_touched: u32,
+    /// Сколько раз вердикт взят из кэша, без прохода по клеткам.
+    pub cached: u32,
+    /// Сколько клеток реально сдвинулось. Без этого числа непонятно, работает
+    /// физика или ядро исправно обходит мир, ничего в нём не меняя.
+    pub moved: u32,
 }
 
 impl Stats {
