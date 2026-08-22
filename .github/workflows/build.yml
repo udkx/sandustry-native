@@ -39,11 +39,16 @@ jobs:
             label: macOS arm64
             artifact: sand-arm64-darwin.node
             built: libsand_node.dylib
-          - os: macos-13
+          # Intel-раннеров macOS на публичных репозиториях мало, и задача висит
+          # в очереди часами. Собираем ту же цель кросс-компиляцией на arm64:
+          # napi на macOS линкуется через dynamic lookup, заголовки Node для
+          # целевой архитектуры не нужны.
+          - os: macos-14
             target: x86_64-apple-darwin
             label: macOS x86_64
             artifact: sand-x64-darwin.node
             built: libsand_node.dylib
+            cross: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             label: Windows x64
@@ -82,7 +87,9 @@ jobs:
         if: runner.os == 'macOS'
         run: codesign --force --sign - "${{ matrix.artifact }}"
 
+      # Кросс-собранный модуль на этом раннере не запустить: архитектура чужая.
       - name: проверить модуль без игры
+        if: ${{ !matrix.cross }}
         shell: bash
         run: |
           mkdir -p js
