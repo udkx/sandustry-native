@@ -151,9 +151,12 @@ a callback into JS per mutation would eat the entire win. Measured, not assumed:
 one over-broad "this pair reacts" test used to send 57 % of all visited cells
 back into JS and made the game with the core **26 % slower** than stock.
 
-The unwritten rules of the game that any code moving its cells must respect are
-collected in [`docs/game-contracts.md`](docs/game-contracts.md) (Russian). Each
-one cost a debugging cycle in a live world.
+Most of the work here was not writing physics — it was discovering the unwritten
+rules the game expects from anything that moves its cells: which flags may be
+written, when a chunk must be woken, why the raster is a separate step from the
+cell grid. Break one and the game does not crash or complain; the world just
+behaves oddly. Every comment in this code that explains "why" is one of those,
+paid for with a debugging cycle in a live world.
 
 ## Known limits
 
